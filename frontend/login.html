@@ -1,0 +1,41 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in – CashPilot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="login.css"></head><body>
+<main class="box">
+  <div class="brand"><div class="mark">₹</div><div><h1>CashPilot</h1><p class="sub">Predictive cash flow, kept private.</p></div></div>
+
+  <div class="tabs" id="tabs" role="tablist">
+    <button type="button" id="t-in" class="on" role="tab" aria-selected="true">Sign in</button>
+    <button type="button" id="t-up" role="tab" aria-selected="false">Create account</button>
+  </div>
+
+  <form id="f" autocomplete="on" novalidate>
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32" required>
+
+    <label for="p">Password</label>
+    <div class="pw">
+      <input id="p" name="password" type="password" autocomplete="current-password" maxlength="128" required>
+      <button type="button" id="eye" aria-label="Show password">Show</button>
+    </div>
+
+    <div id="c-wrap" hidden>
+      <label for="c">Confirm password</label>
+      <input id="c" type="password" autocomplete="new-password" maxlength="128">
+      <p class="hint">At least 8 characters with letters and numbers.</p>
+    </div>
+
+    <p id="msg" role="alert" aria-live="polite"></p>
+    <button class="go" id="go" type="submit">Sign in</button>
+  </form>
+
+  <section id="demo" class="demo" hidden>
+    <b>Try the demo account</b>
+    <p>Username <code id="d-u"></code><br>Password <code id="d-p"></code></p>
+    <button type="button" id="d-go" class="alt">Sign in as demo</button>
+    <span class="hint">Shared and public: don't enter real financial details.</span>
+  </section>
+</main>
+<script src="login.js"></script>
+</body></html>

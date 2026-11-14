@@ -1,0 +1,2 @@
+# CashPilot's backend uses only the Python standard library (Python 3.8+).
+# Nothing to install. This file exists so tools and hosts that expect one do not fail.
