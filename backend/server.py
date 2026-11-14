@@ -43,8 +43,8 @@ FRONTEND = ROOT / "frontend"
 DB_PATH = Path(os.environ.get("CASHPILOT_DB") or (ROOT / "data" / "cashpilot.db"))
 _postgres_schema_ready = False
 
-# Keys the frontend stores (transactions, overrides, limits, learning, notes).
-ALLOWED_KEYS = {"cp2", "cpo", "cpl", "cph", "cpm", "cpf", "cpn"}
+# Keys the frontend stores (transactions, overrides, limits, learning, notes, subscription usage).
+ALLOWED_KEYS = {"cp2", "cpo", "cpl", "cph", "cpm", "cpf", "cpn", "cpu"}
 MAX_BODY = 5 * 1024 * 1024  # 5 MB for app data
 MAX_AUTH_BODY = 4 * 1024    # sign-in / sign-up bodies are tiny
 MAX_BANK_BODY = 4096

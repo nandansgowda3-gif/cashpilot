@@ -1,7 +1,7 @@
 /* Checks you are signed in, loads your saved data from the Python backend, then starts the app.
    Opened straight from disk (file://) it skips the backend and uses the browser's storage (no sign-in). */
 (function () {
-  var KEYS = ['cp2', 'cpo', 'cpl', 'cph', 'cpm', 'cpf', 'cpn'];
+  var KEYS = ['cp2', 'cpo', 'cpl', 'cph', 'cpm', 'cpf', 'cpn', 'cpu'];
   var LOCAL_ONLY_KEYS = ['cp_mobile_cursor'];
   var online = /^https?:$/.test(location.protocol);
   var timers = {};

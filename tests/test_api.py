@@ -287,7 +287,11 @@ class AuthApiTests(unittest.TestCase):
         c.json("DELETE", "/api/state")
         self.assertEqual(c.json("GET", "/api/state")[1], {})
         self.assertEqual(c.json("PUT", "/api/state/cpl", {"value": '{"Food":4000}'})[0], 200)
-        self.assertEqual(c.json("GET", "/api/state")[1], {"cpl": '{"Food":4000}'})
+        self.assertEqual(c.json("PUT", "/api/state/cpu", {"value": '{"NETFLIX":"2026-09-10"}'})[0], 200)
+        self.assertEqual(c.json("GET", "/api/state")[1], {
+            "cpl": '{"Food":4000}',
+            "cpu": '{"NETFLIX":"2026-09-10"}',
+        })
         c.json("DELETE", "/api/state")
         self.assertEqual(c.json("GET", "/api/state")[1], {})
 

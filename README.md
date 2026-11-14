@@ -24,6 +24,10 @@ Port busy? `PORT=8001 python run.py` (Windows PowerShell: `$env:PORT=8001; pytho
 python -m unittest discover -s tests -t . -v
 ```
 
+## Subscription usage suggestions
+
+The **Recurring** tab can track the last-used date for detected recurring payments categorized as subscriptions. Record the date yourself; CashPilot cannot detect usage in other apps. After 60 days without recorded use, it suggests reviewing or cancelling the subscription. The suggestion does not cancel anything, and last-used dates are saved with your account.
+
 ## Deploy to Vercel
 
 Vercel loads the WSGI app at `backend.server:app` (configured in `pyproject.toml`), which serves the frontend and API through the existing authenticated server. Because Vercel's function filesystem is temporary, the app requires a persistent PostgreSQL database.
