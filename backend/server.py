@@ -539,8 +539,10 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _bank_create_consent(self, uid, payload):
-        if not isinstance(payload, dict) or set(payload) != {"vua"} or not isinstance(payload.get("vua"), str):
-            return self._error(400, "Provide only a Setu sandbox mobile number or VUA.")
+        if (not isinstance(payload, dict) or set(payload) != {"vua", "consentAcknowledged"}
+                or not isinstance(payload.get("vua"), str)
+                or payload.get("consentAcknowledged") is not True):
+            return self._error(400, "Confirm you are the account holder and want to review the consent request.")
         vua = payload["vua"].strip()
         if not VUA_RE.fullmatch(vua):
             return self._error(400, "Enter a 10-digit mobile number, optionally followed by an AA handle.")

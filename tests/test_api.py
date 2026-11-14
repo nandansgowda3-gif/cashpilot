@@ -292,6 +292,9 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(c.call("POST", "/api/bank/consent", {"vua": "9876543210"},
                                 csrf=False)[0], 403)
         self.assertEqual(c.json("POST", "/api/bank/consent", {"vua": "not-a-number"})[0], 400)
+        self.assertEqual(c.json("POST", "/api/bank/consent", {
+            "vua": "9876543210", "consentAcknowledged": False
+        })[0], 400)
         self.assertEqual(c.json("POST", "/api/bank/consent", 5)[0], 400)
 
     def test_bank_sandbox_flow_keeps_provider_data_minimal_and_revokes(self):
@@ -346,7 +349,9 @@ class AuthApiTests(unittest.TestCase):
 
         c = self.signed_in()
         with mock.patch.object(server, "SetuAAClient", FakeSetu):
-            code, created = c.json("POST", "/api/bank/consent", {"vua": "9876543210"})
+            code, created = c.json("POST", "/api/bank/consent", {
+                "vua": "9876543210", "consentAcknowledged": True
+            })
             self.assertEqual(code, 201)
             self.assertEqual(created["consentStatus"], "PENDING")
             self.assertEqual(c.json("GET", "/api/bank/status")[1]["consentStatus"], "ACTIVE")
@@ -383,7 +388,9 @@ class AuthApiTests(unittest.TestCase):
         with mock.patch.object(server, "SetuAAClient", UnconfiguredSetu):
             self.assertEqual(c.json("GET", "/api/bank/status"),
                              (200, {"configured": False, "mode": "sandbox"}))
-            self.assertEqual(c.json("POST", "/api/bank/consent", {"vua": "9876543210"})[0], 503)
+            self.assertEqual(c.json("POST", "/api/bank/consent", {
+                "vua": "9876543210", "consentAcknowledged": True
+            })[0], 503)
 
     def test_bank_consent_rejects_non_setu_consent_urls(self):
         class InvalidUrlSetu:
@@ -399,7 +406,7 @@ class AuthApiTests(unittest.TestCase):
         c = self.signed_in()
         with mock.patch.object(server, "SetuAAClient", InvalidUrlSetu):
             self.assertEqual(c.json("POST", "/api/bank/consent",
-                                    {"vua": "9876543210"})[0], 502)
+                                    {"vua": "9876543210", "consentAcknowledged": True})[0], 502)
         self.assertIsNone(server.get_bank_connection(server.find_user("demo")[0]))
 
     def test_rejects_bad_input(self):

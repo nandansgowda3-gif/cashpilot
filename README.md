@@ -47,9 +47,9 @@ Demo sign-in is disabled by default on Vercel. Set `CASHPILOT_DEMO=1` only if yo
 | `CASHPILOT_TRUST_PROXY` | `0` | `1` behind a reverse proxy that sets `X-Forwarded-Proto` / `X-Forwarded-For` |
 | `CASHPILOT_DB` | `data/cashpilot.db` | database file location |
 | `DATABASE_URL` | unset | PostgreSQL connection string; required on Vercel, otherwise SQLite is used |
-| `SETU_CLIENT_ID` | unset | Setu Bridge sandbox client ID; server-side only |
-| `SETU_CLIENT_SECRET` | unset | Setu Bridge sandbox client secret; server-side only |
-| `SETU_PRODUCT_INSTANCE_ID` | unset | Setu sandbox product instance ID; server-side only |
+| `SETU_CLIENT_ID` | unset | Setu Account Aggregator sandbox client ID; server-side only |
+| `SETU_CLIENT_SECRET` | unset | Setu Account Aggregator sandbox client secret; server-side only |
+| `SETU_PRODUCT_INSTANCE_ID` | unset | Setu Account Aggregator sandbox product instance ID; server-side only |
 
 ## How the sign-in is secured
 
@@ -76,7 +76,9 @@ CashPilot does not currently connect to live bank accounts. The previous “Conn
 
 Live Indian bank data requires CashPilot to operate as an eligible FIU or through a regulated FIU partner, and to complete Setu's production onboarding. The intended connection is read-only and consent-based; CashPilot must never collect bank passwords or OTPs. Do not send provider credentials in chat or commit them to the repository. Use sandbox credentials only for the sandbox flow below; live credentials must not be used until production onboarding and an approved production integration are in place.
 
-For sandbox testing only, set `SETU_CLIENT_ID`, `SETU_CLIENT_SECRET`, and `SETU_PRODUCT_INSTANCE_ID` in the server environment using credentials from Setu Bridge. The dashboard then lets a signed-in user request consent, open the Setu sandbox consent flow, request mock data, and inspect the returned transactions. The user's mobile number/VUA is sent to Setu to create consent but is not saved by CashPilot. CashPilot stores only the Setu consent/session IDs, their statuses, the consent URL, and the requested date range. Transaction results are reduced to date, description, amount, transaction ID, and masked account number; provider profile details are not retained. The sandbox UI and API never claim that mock transactions are real activity.
+For sandbox testing only, set `SETU_CLIENT_ID`, `SETU_CLIENT_SECRET`, and `SETU_PRODUCT_INSTANCE_ID` for a Setu Account Aggregator (AA/FIU) sandbox product in the server environment. Credentials for Setu UPI products do not work with this integration. The dashboard then lets a signed-in user request consent, open the Setu AA sandbox consent flow, request mock data, and inspect the returned transactions. The user's mobile number/VUA is sent to Setu to create consent but is not saved by CashPilot. CashPilot stores only the Setu consent/session IDs, their statuses, the consent URL, and the requested date range. Transaction results are reduced to date, description, amount, transaction ID, and masked account number; provider profile details are not retained. The sandbox UI and API never claim that mock transactions are real activity.
+
+CashPilot does not generate Setu API keys; obtain sandbox credentials directly from Setu Bridge and configure them as server environment secrets. Before requesting consent, the account holder must acknowledge the request in CashPilot and then personally approve it in Setu's hosted consent flow. CashPilot cannot approve consent on anyone's behalf. The sandbox request is read-only, asks for up to 90 days of transaction data, and has a one-month consent duration; the account holder can revoke the consent.
 
 The sandbox routes are authenticated and state-changing routes require the app's CSRF header: `GET /api/bank/status`, `POST /api/bank/consent`, `POST /api/bank/sync`, `GET /api/bank/transactions`, and `DELETE /api/bank/connection`. Keep all three Setu variables in the hosting provider's secret/environment settings, never in frontend code or a committed `.env` file.
 
