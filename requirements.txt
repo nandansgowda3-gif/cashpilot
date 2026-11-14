@@ -1,2 +1,2 @@
-# CashPilot's backend uses only the Python standard library (Python 3.8+).
-# Nothing to install. This file exists so tools and hosts that expect one do not fail.
+# Required only for PostgreSQL deployments; local SQLite runs use the standard library.
+psycopg[binary]>=3.2,<4

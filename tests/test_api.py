@@ -57,7 +57,8 @@ class AuthApiTests(unittest.TestCase):
     def setUpClass(cls):
         os.environ["CASHPILOT_QUIET"] = "1"
         for k in ("CASHPILOT_DEMO", "CASHPILOT_DEMO_USER", "CASHPILOT_DEMO_PASSWORD",
-                  "CASHPILOT_ALLOW_SIGNUP", "CASHPILOT_SECURE_COOKIES", "CASHPILOT_TRUST_PROXY"):
+                  "CASHPILOT_ALLOW_SIGNUP", "CASHPILOT_SECURE_COOKIES", "CASHPILOT_TRUST_PROXY",
+                  "DATABASE_URL", "VERCEL"):
             os.environ.pop(k, None)
         server.PBKDF2_ITERATIONS = 1000  # fast for tests; production uses 600,000
         cls.tmp = tempfile.TemporaryDirectory()
@@ -269,6 +270,16 @@ class AuthApiTests(unittest.TestCase):
                                          {"username": "carol", "password": "Carol-pass-9"})[0], 403)
         finally:
             del os.environ["CASHPILOT_ALLOW_SIGNUP"]
+
+    def test_vercel_requires_persistent_database(self):
+        os.environ["VERCEL"] = "1"
+        try:
+            self.assertFalse(server.demo_enabled())
+            self.assertTrue(server.secure_cookies())
+            with self.assertRaisesRegex(RuntimeError, "DATABASE_URL"):
+                server._connect()
+        finally:
+            del os.environ["VERCEL"]
 
     def test_no_path_traversal(self):
         c = self.signed_in()

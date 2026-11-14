@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlparse
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 DB_PATH = Path(os.environ.get("CASHPILOT_DB") or (ROOT / "data" / "cashpilot.db"))
+_postgres_schema_ready = False
 
 # Keys the frontend stores (transactions, overrides, limits, learning, notes).
 ALLOWED_KEYS = {"cp2", "cpo", "cpl", "cph", "cpm", "cpf", "cpn"}
@@ -77,7 +78,7 @@ def _flag(name, default):
 
 
 def demo_enabled():
-    return _flag("CASHPILOT_DEMO", True)
+    return _flag("CASHPILOT_DEMO", not bool(os.environ.get("VERCEL")))
 
 
 def demo_user():
@@ -93,7 +94,7 @@ def signup_allowed():
 
 
 def secure_cookies():
-    return _flag("CASHPILOT_SECURE_COOKIES", False)
+    return _flag("CASHPILOT_SECURE_COOKIES", bool(os.environ.get("VERCEL")))
 
 
 def trust_proxy():
@@ -101,7 +102,59 @@ def trust_proxy():
 
 
 # ---- database -------------------------------------------------------------
+class PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, query, params=()):
+        return self.connection.execute(query.replace("?", "%s"), params)
+
+    def close(self):
+        self.connection.close()
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.connection.__exit__(exc_type, exc_value, traceback)
+
+
 def _connect():
+    global _postgres_schema_ready
+    database_url = os.environ.get("DATABASE_URL")
+    if os.environ.get("VERCEL") and not database_url:
+        raise RuntimeError("DATABASE_URL must point to a persistent PostgreSQL database on Vercel.")
+    if database_url:
+        import psycopg
+
+        conn = psycopg.connect(database_url, connect_timeout=10)
+        if not _postgres_schema_ready:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS users ("
+                " id BIGSERIAL PRIMARY KEY,"
+                " username TEXT NOT NULL,"
+                " pw_hash TEXT NOT NULL,"
+                " created TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (lower(username))")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS user_state ("
+                " user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                " key TEXT NOT NULL, value TEXT NOT NULL,"
+                " updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                " PRIMARY KEY (user_id, key))"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                " token_hash TEXT PRIMARY KEY,"
+                " user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                " created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL)"
+            )
+            conn.commit()
+            _postgres_schema_ready = True
+        return PostgresConnection(conn)
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     fresh = not DB_PATH.exists()
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
@@ -190,7 +243,7 @@ def password_problem(username, password):
 # ---- users and sessions -----------------------------------------------------
 def find_user(username):
     return _db(lambda c: c.execute(
-        "SELECT id, username, pw_hash FROM users WHERE username = ?", (username,)).fetchone())
+        "SELECT id, username, pw_hash FROM users WHERE lower(username) = lower(?)", (username,)).fetchone())
 
 
 def add_user(username, password):
@@ -198,6 +251,14 @@ def add_user(username, password):
     pw = hash_password(password)  # slow on purpose; done outside the DB lock
 
     def f(c):
+        if isinstance(c, PostgresConnection):
+            import psycopg
+            try:
+                return c.execute(
+                    "INSERT INTO users (username, pw_hash) VALUES (?, ?) RETURNING id",
+                    (username, pw)).fetchone()[0]
+            except psycopg.IntegrityError:
+                return None
         try:
             return c.execute("INSERT INTO users (username, pw_hash) VALUES (?, ?)",
                              (username, pw)).lastrowid

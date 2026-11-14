@@ -24,6 +24,17 @@ Port busy? `PORT=8001 python run.py` (Windows PowerShell: `$env:PORT=8001; pytho
 python -m unittest discover -s tests -t . -v
 ```
 
+## Deploy to Vercel
+
+The Vercel deployment serves `frontend/` as static files and routes `/api/*` to a Python function. Because Vercel's function filesystem is temporary, the API requires a persistent PostgreSQL database.
+
+1. Import this GitHub repository into Vercel.
+2. Create or connect a PostgreSQL database (for example, through Vercel's Neon integration).
+3. Add its connection string as the `DATABASE_URL` environment variable in Vercel.
+4. Deploy. The database tables are created automatically on the first function start.
+
+Demo sign-in is disabled by default on Vercel. Set `CASHPILOT_DEMO=1` only if you intentionally want a public, shared demo account. HTTPS cookies are enabled automatically on Vercel.
+
 ## Settings (environment variables)
 
 | Variable | Default | Meaning |
@@ -35,6 +46,7 @@ python -m unittest discover -s tests -t . -v
 | `CASHPILOT_SECURE_COOKIES` | `0` | `1` when served over HTTPS: adds the `Secure` cookie flag and HSTS |
 | `CASHPILOT_TRUST_PROXY` | `0` | `1` behind a reverse proxy that sets `X-Forwarded-Proto` / `X-Forwarded-For` |
 | `CASHPILOT_DB` | `data/cashpilot.db` | database file location |
+| `DATABASE_URL` | unset | PostgreSQL connection string; required on Vercel, otherwise SQLite is used |
 
 ## How the sign-in is secured
 
