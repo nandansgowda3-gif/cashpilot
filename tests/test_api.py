@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sqlite3
@@ -86,6 +87,50 @@ class AuthApiTests(unittest.TestCase):
     # ---- public bits -------------------------------------------------
     def test_health_is_public(self):
         self.assertEqual(self.c.json("GET", "/api/health"), (200, {"status": "ok"}))
+
+    def test_wsgi_entrypoint_routes_api_and_static_requests(self):
+        def call(path, method="GET", payload=None, headers=None):
+            result = {}
+            body = json.dumps(payload).encode() if payload is not None else b""
+
+            def start_response(status, headers):
+                result["status"] = status
+                result["headers"] = dict(headers)
+
+            body = b"".join(server.app({
+                "REQUEST_METHOD": method,
+                "PATH_INFO": path,
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.url_scheme": "http",
+                "SERVER_NAME": "localhost",
+                "SERVER_PORT": "80",
+                "REMOTE_ADDR": "127.0.0.1",
+                **(headers or {}),
+            }, start_response))
+            return result, body
+
+        result, body = call("/api/health")
+        self.assertEqual(result["status"], "200 OK")
+        self.assertEqual(json.loads(body), {"status": "ok"})
+
+        result, _ = call("/")
+        self.assertEqual(result["status"], "302 Found")
+        self.assertEqual(result["headers"]["Location"], "/login")
+
+        result, body = call("/login")
+        self.assertEqual(result["status"], "200 OK")
+        self.assertIn(b"login", body.lower())
+
+        result, body = call(
+            "/api/login",
+            method="POST",
+            payload={"username": "demo", "password": "Demo@1234"},
+            headers={"HTTP_X_REQUESTED_WITH": "cashpilot"},
+        )
+        self.assertEqual(result["status"], "200 OK")
+        self.assertIn("HttpOnly", result["headers"]["Set-Cookie"])
 
     def test_config_shows_demo_login(self):
         code, cfg = self.c.json("GET", "/api/config")

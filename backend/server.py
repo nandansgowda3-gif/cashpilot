@@ -17,6 +17,7 @@ Security model (see README for the full list):
 import base64
 import hashlib
 import hmac
+import io
 import json
 import mimetypes
 import os
@@ -26,6 +27,8 @@ import sqlite3
 import sys
 import threading
 import time
+from email.message import Message
+from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -631,6 +634,63 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         csp = CSP_LOGIN if rel in PUBLIC_FILES else CSP_APP
         self._send(200, target.read_bytes(), ctype, csp=csp)
+
+
+class _WSGIHandler(Handler):
+    def send_response(self, code, message=None):
+        del message
+        self._response_status = code
+        self._response_headers = []
+
+    def send_header(self, keyword, value):
+        self._response_headers.append((keyword, value))
+
+    def end_headers(self):
+        pass
+
+
+def app(environ, start_response):
+    _connect().close()
+    ensure_demo()
+
+    request = _WSGIHandler.__new__(_WSGIHandler)
+    request.command = environ.get("REQUEST_METHOD", "GET").upper()
+    request.path = environ.get("PATH_INFO") or "/"
+    query = environ.get("QUERY_STRING", "")
+    if query:
+        request.path += "?" + query
+    request.requestline = "%s %s" % (request.command, request.path)
+    request.headers = Message()
+    for key, value in environ.items():
+        if key.startswith("HTTP_"):
+            request.headers[key[5:].replace("_", "-")] = value
+    request.headers["Content-Length"] = environ.get("CONTENT_LENGTH") or "0"
+    if environ.get("CONTENT_TYPE"):
+        request.headers["Content-Type"] = environ["CONTENT_TYPE"]
+    if not request.headers.get("Host"):
+        scheme = environ.get("wsgi.url_scheme", "http")
+        default_port = "443" if scheme == "https" else "80"
+        host = environ.get("SERVER_NAME", "localhost")
+        port = environ.get("SERVER_PORT", default_port)
+        request.headers["Host"] = host if port == default_port else "%s:%s" % (host, port)
+    request.client_address = (environ.get("REMOTE_ADDR", ""), 0)
+    request.rfile = environ["wsgi.input"]
+    request.wfile = io.BytesIO()
+    request._response_status = 200
+    request._response_headers = []
+
+    method = getattr(request, "do_" + request.command, None)
+    if method is None:
+        request._error(501, "Unsupported method")
+    else:
+        method()
+
+    status = HTTPStatus(request._response_status)
+    start_response(
+        "%d %s" % (status.value, status.phrase),
+        [(name, str(value)) for name, value in request._response_headers],
+    )
+    return [request.wfile.getvalue()]
 
 
 def make_server(host="127.0.0.1", port=8000):

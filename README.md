@@ -26,7 +26,7 @@ python -m unittest discover -s tests -t . -v
 
 ## Deploy to Vercel
 
-The Vercel deployment serves `frontend/` as static files and routes `/api/*` to a Python function. Because Vercel's function filesystem is temporary, the API requires a persistent PostgreSQL database.
+Vercel loads the WSGI app at `backend.server:app` (configured in `pyproject.toml`), which serves the frontend and API through the existing authenticated server. Because Vercel's function filesystem is temporary, the app requires a persistent PostgreSQL database.
 
 1. Import this GitHub repository into Vercel.
 2. Create or connect a PostgreSQL database (for example, through Vercel's Neon integration).
