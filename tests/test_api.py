@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from backend import server
 
@@ -77,6 +78,7 @@ class AuthApiTests(unittest.TestCase):
 
     def setUp(self):
         server.LIMITER.reset()
+        server.delete_bank_connection(server.find_user("demo")[0])
         self.c = Client(self.base)
 
     def signed_in(self, user="demo", pw="Demo@1234"):
@@ -282,6 +284,123 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(c.json("GET", "/api/state")[1], {"cpl": '{"Food":4000}'})
         c.json("DELETE", "/api/state")
         self.assertEqual(c.json("GET", "/api/state")[1], {})
+
+    def test_bank_routes_require_auth_csrf_and_valid_vua(self):
+        self.assertEqual(self.c.json("GET", "/api/bank/status")[0], 401)
+        self.assertEqual(self.c.json("GET", "/api/bank/transactions")[0], 401)
+        c = self.signed_in()
+        self.assertEqual(c.call("POST", "/api/bank/consent", {"vua": "9876543210"},
+                                csrf=False)[0], 403)
+        self.assertEqual(c.json("POST", "/api/bank/consent", {"vua": "not-a-number"})[0], 400)
+        self.assertEqual(c.json("POST", "/api/bank/consent", 5)[0], 400)
+
+    def test_bank_sandbox_flow_keeps_provider_data_minimal_and_revokes(self):
+        consent_id = "12345678-1234-1234-1234-123456789012"
+        session_id = "87654321-4321-4321-4321-210987654321"
+
+        class FakeSetu:
+            configured = True
+            revoked = False
+
+            def create_consent(self, vua, data_range):
+                self.__class__.vua = vua
+                self.__class__.data_range = data_range
+                return {
+                    "id": consent_id,
+                    "url": "https://fiu-sandbox.setu.co/v2/consents/webview/" + consent_id,
+                    "status": "PENDING",
+                }
+
+            def get_consent(self, current_id):
+                return {"id": current_id, "status": "ACTIVE", "profile": {"name": "Private Name"}}
+
+            def create_data_session(self, current_id, data_range):
+                self.__class__.session_range = data_range
+                return {"id": session_id, "status": "COMPLETED"}
+
+            def get_data_session(self, current_id):
+                return {
+                    "status": "COMPLETED",
+                    "data": {
+                        "fips": [{
+                            "accounts": [{
+                                "maskedAccNumber": "XXXX1234",
+                                "data": {
+                                    "account": {"transactions": {"transaction": [{
+                                        "amount": "1250.50",
+                                        "type": "DEBIT",
+                                        "transactionTimestamp": "2025-05-01T10:15:00Z",
+                                        "narration": "MOCK MARKET",
+                                        "txnId": "txn-1",
+                                    }]}},
+                                    "profile": {"name": "Private Name", "mobile": "9876543210"},
+                                },
+                            }],
+                        }],
+                    },
+                }
+
+            def revoke_consent(self, current_id):
+                self.__class__.revoked = True
+                return {"id": current_id, "status": "REVOKED"}
+
+        c = self.signed_in()
+        with mock.patch.object(server, "SetuAAClient", FakeSetu):
+            code, created = c.json("POST", "/api/bank/consent", {"vua": "9876543210"})
+            self.assertEqual(code, 201)
+            self.assertEqual(created["consentStatus"], "PENDING")
+            self.assertEqual(c.json("GET", "/api/bank/status")[1]["consentStatus"], "ACTIVE")
+            self.assertEqual(c.json("POST", "/api/bank/sync")[0], 201)
+            code, body = c.json("GET", "/api/bank/transactions")
+            self.assertEqual(code, 200)
+            self.assertEqual(body["sessionStatus"], "COMPLETED")
+            self.assertEqual(body["transactions"], [{
+                "id": "txn-1",
+                "date": "2025-05-01",
+                "description": "MOCK MARKET",
+                "amount": "-1250.50",
+                "maskedAccount": "XXXX1234",
+            }])
+            self.assertNotIn("Private Name", json.dumps(body))
+            self.assertEqual(c.json("DELETE", "/api/bank/connection")[0], 200)
+            self.assertTrue(FakeSetu.revoked)
+
+        conn = sqlite3.connect(str(server.DB_PATH))
+        try:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM bank_connections WHERE user_id = ?", (server.find_user("demo")[0],)
+            ).fetchone())
+        finally:
+            conn.close()
+        self.assertEqual(FakeSetu.vua, "9876543210")
+        self.assertNotIn("9876543210", json.dumps(FakeSetu.data_range))
+
+    def test_bank_status_reports_unconfigured_server_without_accepting_credentials(self):
+        class UnconfiguredSetu:
+            configured = False
+
+        c = self.signed_in()
+        with mock.patch.object(server, "SetuAAClient", UnconfiguredSetu):
+            self.assertEqual(c.json("GET", "/api/bank/status"),
+                             (200, {"configured": False, "mode": "sandbox"}))
+            self.assertEqual(c.json("POST", "/api/bank/consent", {"vua": "9876543210"})[0], 503)
+
+    def test_bank_consent_rejects_non_setu_consent_urls(self):
+        class InvalidUrlSetu:
+            configured = True
+
+            def create_consent(self, vua, data_range):
+                return {
+                    "id": "12345678-1234-1234-1234-123456789012",
+                    "url": "https://attacker.example/consent",
+                    "status": "PENDING",
+                }
+
+        c = self.signed_in()
+        with mock.patch.object(server, "SetuAAClient", InvalidUrlSetu):
+            self.assertEqual(c.json("POST", "/api/bank/consent",
+                                    {"vua": "9876543210"})[0], 502)
+        self.assertIsNone(server.get_bank_connection(server.find_user("demo")[0]))
 
     def test_rejects_bad_input(self):
         c = self.signed_in()

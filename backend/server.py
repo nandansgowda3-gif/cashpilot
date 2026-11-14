@@ -27,12 +27,15 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+from backend.setu_aa import SetuAAClient, SetuError, extract_transactions
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -43,6 +46,7 @@ _postgres_schema_ready = False
 ALLOWED_KEYS = {"cp2", "cpo", "cpl", "cph", "cpm", "cpf", "cpn"}
 MAX_BODY = 5 * 1024 * 1024  # 5 MB for app data
 MAX_AUTH_BODY = 4 * 1024    # sign-in / sign-up bodies are tiny
+MAX_BANK_BODY = 4096
 
 COOKIE = "cp_session"
 CSRF_HEADER = "X-Requested-With"
@@ -53,6 +57,8 @@ SESSION_IDLE = 8 * 3600       # signed out after 8 hours without use
 SESSION_MAX = 7 * 86400       # and never later than 7 days after sign-in
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+VUA_RE = re.compile(r"^[0-9]{10}(?:@[A-Za-z0-9.-]{1,32})?$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 MIN_PASSWORD, MAX_PASSWORD = 8, 128
 COMMON_PASSWORDS = {
     "password", "password1", "password123", "12345678", "123456789", "1234567890",
@@ -154,6 +160,14 @@ def _connect():
                 " user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
                 " created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bank_connections ("
+                " user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,"
+                " consent_id TEXT NOT NULL, consent_url TEXT NOT NULL,"
+                " consent_status TEXT NOT NULL, range_from TEXT NOT NULL, range_to TEXT NOT NULL,"
+                " session_id TEXT, session_status TEXT,"
+                " updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
             conn.commit()
             _postgres_schema_ready = True
         return PostgresConnection(conn)
@@ -177,6 +191,12 @@ def _connect():
         " token_hash TEXT PRIMARY KEY,"
         " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
         " created REAL NOT NULL, expires REAL NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS bank_connections ("
+        " user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,"
+        " consent_id TEXT NOT NULL, consent_url TEXT NOT NULL,"
+        " consent_status TEXT NOT NULL, range_from TEXT NOT NULL, range_to TEXT NOT NULL,"
+        " session_id TEXT, session_status TEXT,"
+        " updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
     )
     if fresh:
         try:
@@ -343,6 +363,41 @@ def clear_all(uid):
     _db(lambda c: c.execute("DELETE FROM user_state WHERE user_id = ?", (uid,)))
 
 
+def get_bank_connection(uid):
+    row = _db(lambda c: c.execute(
+        "SELECT consent_id, consent_url, consent_status, range_from, range_to, session_id, session_status "
+        "FROM bank_connections WHERE user_id = ?", (uid,)).fetchone())
+    if not row:
+        return None
+    return {
+        "consent_id": row[0],
+        "consent_url": row[1],
+        "consent_status": row[2],
+        "range_from": row[3],
+        "range_to": row[4],
+        "session_id": row[5],
+        "session_status": row[6],
+    }
+
+
+def save_bank_connection(uid, connection):
+    _db(lambda c: c.execute(
+        "INSERT INTO bank_connections "
+        "(user_id, consent_id, consent_url, consent_status, range_from, range_to, session_id, session_status, updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(user_id) DO UPDATE SET consent_id=excluded.consent_id, "
+        "consent_url=excluded.consent_url, consent_status=excluded.consent_status, "
+        "range_from=excluded.range_from, range_to=excluded.range_to, session_id=excluded.session_id, "
+        "session_status=excluded.session_status, updated=CURRENT_TIMESTAMP",
+        (uid, connection["consent_id"], connection["consent_url"], connection["consent_status"],
+         connection["range_from"], connection["range_to"], connection.get("session_id"),
+         connection.get("session_status"))))
+
+
+def delete_bank_connection(uid):
+    _db(lambda c: c.execute("DELETE FROM bank_connections WHERE user_id = ?", (uid,)))
+
+
 # ---- rate limiting ----------------------------------------------------------
 class Limiter:
     """Remembers recent failures in memory (resets when the server restarts)."""
@@ -381,6 +436,32 @@ class Limiter:
 
 LIMITER = Limiter()
 LOGIN_WINDOW = 15 * 60
+
+
+def _setu_status(payload, allowed, label):
+    value = payload.get("status")
+    if not isinstance(value, str) and isinstance(payload.get("data"), dict):
+        value = payload["data"].get("status")
+    if not isinstance(value, str) or value.upper() not in allowed:
+        raise SetuError("Setu sandbox returned an unknown %s status." % label)
+    return value.upper()
+
+
+def _setu_consent_url(value, consent_id):
+    if not isinstance(value, str):
+        raise SetuError("Setu sandbox did not return a consent URL.")
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        raise SetuError("Setu sandbox returned an invalid consent URL.") from None
+    if (parsed.scheme != "https" or parsed.netloc != "fiu-sandbox.setu.co"
+            or parsed.path != "/v2/consents/webview/" + consent_id):
+        raise SetuError("Setu sandbox returned an invalid consent URL.")
+    return value
+
+
+def _utc_iso(value):
+    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -426,6 +507,153 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, code, message, headers=None):
         self._send(code, {"error": message}, headers=headers)
+
+    def _bank_status(self, uid):
+        client = SetuAAClient()
+        state = get_bank_connection(uid)
+        if not client.configured:
+            return self._send(200, {"configured": False, "mode": "sandbox"})
+        if not state:
+            return self._send(200, {"configured": True, "mode": "sandbox"})
+        if not UUID_RE.fullmatch(state["consent_id"]):
+            return self._error(500, "Stored Setu consent state is invalid.")
+        try:
+            consent = client.get_consent(state["consent_id"])
+            state["consent_status"] = _setu_status(
+                consent, {"PENDING", "ACTIVE", "REJECTED", "REVOKED", "PAUSED", "EXPIRED"}, "consent")
+            if state["session_id"]:
+                if not UUID_RE.fullmatch(state["session_id"]):
+                    return self._error(500, "Stored Setu session state is invalid.")
+                session = client.get_data_session(state["session_id"])
+                state["session_status"] = _setu_status(
+                    session, {"PENDING", "PARTIAL", "COMPLETED", "FAILED", "EXPIRED"}, "data session")
+            save_bank_connection(uid, state)
+        except SetuError as exc:
+            return self._error(502, str(exc))
+        return self._send(200, {
+            "configured": True,
+            "mode": "sandbox",
+            "consentStatus": state["consent_status"],
+            "consentUrl": state["consent_url"],
+            "sessionStatus": state["session_status"],
+        })
+
+    def _bank_create_consent(self, uid, payload):
+        if not isinstance(payload, dict) or set(payload) != {"vua"} or not isinstance(payload.get("vua"), str):
+            return self._error(400, "Provide only a Setu sandbox mobile number or VUA.")
+        vua = payload["vua"].strip()
+        if not VUA_RE.fullmatch(vua):
+            return self._error(400, "Enter a 10-digit mobile number, optionally followed by an AA handle.")
+        client = SetuAAClient()
+        if not client.configured:
+            return self._error(503, "Setu sandbox credentials are not configured on the server.")
+        if get_bank_connection(uid):
+            return self._error(409, "Disconnect the existing Setu sandbox consent first.")
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        data_range = {"from": _utc_iso(now - timedelta(days=90)), "to": _utc_iso(now)}
+        try:
+            response = client.create_consent(vua, data_range)
+            consent_id = response.get("id")
+            if not isinstance(consent_id, str) or not UUID_RE.fullmatch(consent_id):
+                raise SetuError("Setu sandbox did not return a valid consent ID.")
+            consent_url = _setu_consent_url(response.get("url"), consent_id)
+            consent_status = _setu_status(
+                response, {"PENDING", "ACTIVE", "REJECTED", "REVOKED", "PAUSED", "EXPIRED"}, "consent")
+        except SetuError as exc:
+            return self._error(502, str(exc))
+        save_bank_connection(uid, {
+            "consent_id": consent_id,
+            "consent_url": consent_url,
+            "consent_status": consent_status,
+            "range_from": data_range["from"],
+            "range_to": data_range["to"],
+            "session_id": None,
+            "session_status": None,
+        })
+        return self._send(201, {"consentUrl": consent_url, "consentStatus": consent_status})
+
+    def _bank_create_session(self, uid):
+        client = SetuAAClient()
+        if not client.configured:
+            return self._error(503, "Setu sandbox credentials are not configured on the server.")
+        state = get_bank_connection(uid)
+        if not state:
+            return self._error(409, "Start a Setu sandbox consent first.")
+        if state["session_id"]:
+            return self._error(409, "A sandbox data session already exists; fetch it or disconnect first.")
+        if not UUID_RE.fullmatch(state["consent_id"]):
+            return self._error(500, "Stored Setu consent state is invalid.")
+        try:
+            consent = client.get_consent(state["consent_id"])
+            consent_status = _setu_status(
+                consent, {"PENDING", "ACTIVE", "REJECTED", "REVOKED", "PAUSED", "EXPIRED"}, "consent")
+            state["consent_status"] = consent_status
+            if consent_status != "ACTIVE":
+                save_bank_connection(uid, state)
+                return self._error(409, "Setu consent is not active yet; check its status and approve it first.")
+            response = client.create_data_session(state["consent_id"], {
+                "from": state["range_from"],
+                "to": state["range_to"],
+            })
+            session_id = response.get("id")
+            if not isinstance(session_id, str) or not UUID_RE.fullmatch(session_id):
+                raise SetuError("Setu sandbox did not return a valid data session ID.")
+            session_status = _setu_status(
+                response, {"PENDING", "PARTIAL", "COMPLETED", "FAILED", "EXPIRED"}, "data session")
+        except SetuError as exc:
+            return self._error(502, str(exc))
+        state["session_id"] = session_id
+        state["session_status"] = session_status
+        save_bank_connection(uid, state)
+        return self._send(201, {"sessionStatus": session_status})
+
+    def _bank_transactions(self, uid):
+        client = SetuAAClient()
+        if not client.configured:
+            return self._error(503, "Setu sandbox credentials are not configured on the server.")
+        state = get_bank_connection(uid)
+        if not state or not state["session_id"]:
+            return self._error(409, "Request a Setu sandbox data session first.")
+        if not UUID_RE.fullmatch(state["session_id"]):
+            return self._error(500, "Stored Setu session state is invalid.")
+        try:
+            response = client.get_data_session(state["session_id"])
+            status = _setu_status(
+                response, {"PENDING", "PARTIAL", "COMPLETED", "FAILED", "EXPIRED"}, "data session")
+            state["session_status"] = status
+            save_bank_connection(uid, state)
+            if status == "PENDING":
+                return self._send(202, {"sessionStatus": status, "transactions": []})
+            if status not in {"PARTIAL", "COMPLETED"}:
+                return self._error(409, "Setu sandbox session is %s." % status)
+            transactions = extract_transactions(response)
+        except SetuError as exc:
+            return self._error(502, str(exc))
+        return self._send(200, {"sessionStatus": status, "transactions": transactions})
+
+    def _bank_disconnect(self, uid):
+        state = get_bank_connection(uid)
+        if not state:
+            return self._send(200, {"ok": True})
+        client = SetuAAClient()
+        if not client.configured:
+            return self._error(503, "Setu sandbox credentials are not configured; revoke consent in the Setu AA app.")
+        if not UUID_RE.fullmatch(state["consent_id"]):
+            return self._error(500, "Stored Setu consent state is invalid.")
+        try:
+            consent = client.get_consent(state["consent_id"])
+            status = _setu_status(
+                consent, {"PENDING", "ACTIVE", "REJECTED", "REVOKED", "PAUSED", "EXPIRED"}, "consent")
+            if status not in {"REJECTED", "REVOKED", "EXPIRED"}:
+                result = client.revoke_consent(state["consent_id"])
+                if _setu_status(
+                        result, {"PENDING", "ACTIVE", "REJECTED", "REVOKED", "PAUSED", "EXPIRED"},
+                        "consent") != "REVOKED":
+                    raise SetuError("Setu sandbox did not confirm consent revocation.")
+        except SetuError as exc:
+            return self._error(502, str(exc))
+        delete_bank_connection(uid)
+        return self._send(200, {"ok": True})
 
     def _redirect(self, location):
         self._send(302, b"", "text/plain", headers=[("Location", location)])
@@ -508,6 +736,13 @@ class Handler(BaseHTTPRequestHandler):
             if not who:
                 return self._error(401, "Not signed in")
             return self._send(200, {"username": who[1]})
+        if path in ("/api/bank/status", "/api/bank/transactions"):
+            who = self._auth()
+            if not who:
+                return self._error(401, "Not signed in")
+            if path == "/api/bank/status":
+                return self._bank_status(who[0])
+            return self._bank_transactions(who[0])
         if path in ("/api/state", "/api/export"):
             who = self._auth()
             if not who:
@@ -522,6 +757,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path in ("/api/bank/consent", "/api/bank/sync"):
+            if not self._csrf_ok():
+                return self._error(403, "Request blocked")
+            who = self._auth()
+            if not who:
+                return self._error(401, "Not signed in")
+            if path == "/api/bank/consent":
+                data = self._json_body(MAX_BANK_BODY)
+                if data is None:
+                    return
+                return self._bank_create_consent(who[0], data)
+            return self._bank_create_session(who[0])
         if path not in ("/api/login", "/api/register", "/api/logout"):
             return self._error(404, "Unknown API route")
         if not self._csrf_ok():
@@ -601,13 +848,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def do_DELETE(self):
-        if urlparse(self.path).path != "/api/state":
+        path = urlparse(self.path).path
+        if path not in ("/api/state", "/api/bank/connection"):
             return self._error(404, "Unknown API route")
         who = self._auth()
         if not who:
             return self._error(401, "Not signed in")
         if not self._csrf_ok():
             return self._error(403, "Request blocked")
+        if path == "/api/bank/connection":
+            return self._bank_disconnect(who[0])
         clear_all(who[0])
         self._send(200, {"ok": True})
 

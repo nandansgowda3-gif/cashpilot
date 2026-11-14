@@ -47,6 +47,9 @@ Demo sign-in is disabled by default on Vercel. Set `CASHPILOT_DEMO=1` only if yo
 | `CASHPILOT_TRUST_PROXY` | `0` | `1` behind a reverse proxy that sets `X-Forwarded-Proto` / `X-Forwarded-For` |
 | `CASHPILOT_DB` | `data/cashpilot.db` | database file location |
 | `DATABASE_URL` | unset | PostgreSQL connection string; required on Vercel, otherwise SQLite is used |
+| `SETU_CLIENT_ID` | unset | Setu Bridge sandbox client ID; server-side only |
+| `SETU_CLIENT_SECRET` | unset | Setu Bridge sandbox client secret; server-side only |
+| `SETU_PRODUCT_INSTANCE_ID` | unset | Setu sandbox product instance ID; server-side only |
 
 ## How the sign-in is secured
 
@@ -67,14 +70,24 @@ Demo sign-in is disabled by default on Vercel. Set `CASHPILOT_DEMO=1` only if yo
 
 Known limits: the dashboard builds its buttons with inline handlers, so its policy has to allow inline scripts (the login page is strict). Failed-attempt counters live in memory and reset when the server restarts. There is no password reset by email; the database owner can delete an account. Data saved by the earlier single-user version stays in the old table and is not shown to any account.
 
+## Bank connections
+
+CashPilot does not currently connect to live bank accounts. The previous “Connect bank (demo)” action generated synthetic transactions and has been removed. Setu's Account Aggregator sandbox also uses mock data, not your account activity.
+
+Live Indian bank data requires CashPilot to operate as an eligible FIU or through a regulated FIU partner, and to complete Setu's production onboarding. The intended connection is read-only and consent-based; CashPilot must never collect bank passwords or OTPs. Do not send provider credentials in chat or commit them to the repository. Use sandbox credentials only for the sandbox flow below; live credentials must not be used until production onboarding and an approved production integration are in place.
+
+For sandbox testing only, set `SETU_CLIENT_ID`, `SETU_CLIENT_SECRET`, and `SETU_PRODUCT_INSTANCE_ID` in the server environment using credentials from Setu Bridge. The dashboard then lets a signed-in user request consent, open the Setu sandbox consent flow, request mock data, and inspect the returned transactions. The user's mobile number/VUA is sent to Setu to create consent but is not saved by CashPilot. CashPilot stores only the Setu consent/session IDs, their statuses, the consent URL, and the requested date range. Transaction results are reduced to date, description, amount, transaction ID, and masked account number; provider profile details are not retained. The sandbox UI and API never claim that mock transactions are real activity.
+
+The sandbox routes are authenticated and state-changing routes require the app's CSRF header: `GET /api/bank/status`, `POST /api/bank/consent`, `POST /api/bank/sync`, `GET /api/bank/transactions`, and `DELETE /api/bank/connection`. Keep all three Setu variables in the hosting provider's secret/environment settings, never in frontend code or a committed `.env` file.
+
 ## How it fits together
 
 - `frontend/login.html` (+ `login.js`, `login.css`) is the sign-in page. `index.html` is the app (plain HTML and JavaScript). `boot.js` checks you are signed in, loads your saved data from the backend, then starts `app.js`.
-- `backend/server.py` serves the frontend and stores users, sessions and app data in `data/cashpilot.db` (SQLite). API: `POST /api/login`, `/api/register`, `/api/logout`; `GET /api/me`, `/api/config`, `/api/health`, `/api/state`, `/api/export`; `PUT /api/state/<key>`; `DELETE /api/state`.
+- `backend/server.py` serves the frontend and stores users, sessions, app data, and minimal Setu sandbox consent state in `data/cashpilot.db` (SQLite). API: `POST /api/login`, `/api/register`, `/api/logout`; `GET /api/me`, `/api/config`, `/api/health`, `/api/state`, `/api/export`; `PUT /api/state/<key>`; `DELETE /api/state`; plus the sandbox endpoints above.
 - Opening `frontend/index.html` directly from disk still works for a quick look, with no sign-in: it uses the browser's own storage instead of the backend.
 
 ## Notes
 
 - Money tab: tap a spending category (or "Edit received money") to change totals, amounts, descriptions and categories, or delete items.
-- "Connect bank (demo)" only simulates transactions.
+- CSV import is currently the only way to bring in transactions from a bank statement; live bank sync is not enabled.
 - The assistant (robot button) understands a fixed set of phrases; type `help` to see them.
