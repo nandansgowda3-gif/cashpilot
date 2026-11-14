@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">CashPilot Companion</string>
+    <string name="notification_listener_label">CashPilot transaction import</string>
+</resources>

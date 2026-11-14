@@ -78,7 +78,13 @@ class AuthApiTests(unittest.TestCase):
 
     def setUp(self):
         server.LIMITER.reset()
-        server.delete_bank_connection(server.find_user("demo")[0])
+        uid = server.find_user("demo")[0]
+        server.delete_bank_connection(uid)
+        server._db(lambda c: (
+            c.execute("DELETE FROM mobile_pairings WHERE user_id = ?", (uid,)),
+            c.execute("DELETE FROM mobile_devices WHERE user_id = ?", (uid,)),
+            c.execute("DELETE FROM mobile_transactions WHERE user_id = ?", (uid,)),
+        ))
         self.c = Client(self.base)
 
     def signed_in(self, user="demo", pw="Demo@1234"):
@@ -284,6 +290,89 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(c.json("GET", "/api/state")[1], {"cpl": '{"Food":4000}'})
         c.json("DELETE", "/api/state")
         self.assertEqual(c.json("GET", "/api/state")[1], {})
+
+    def test_mobile_pairing_is_one_time_and_devices_are_revocable(self):
+        self.assertEqual(self.c.json("GET", "/api/mobile/devices")[0], 401)
+        c = self.signed_in()
+        self.assertEqual(c.json("POST", "/api/mobile/pairing",
+                                {"notificationsAcknowledged": True}, csrf=False)[0], 403)
+        self.assertEqual(c.json("POST", "/api/mobile/pairing",
+                                {"notificationsAcknowledged": False})[0], 400)
+        code, result = c.json("POST", "/api/mobile/pairing",
+                              {"notificationsAcknowledged": True})
+        self.assertEqual(code, 201)
+        self.assertEqual(result["expiresIn"], 300)
+        paired_code, device = self.c.json("POST", "/api/mobile/pair", {
+            "code": result["code"], "deviceName": "Test Android",
+        })
+        self.assertEqual(paired_code, 201)
+        self.assertEqual(len(device["token"]), 43)
+        self.assertEqual(self.c.json("POST", "/api/mobile/pair", {"code": result["code"]})[0], 401)
+        stored_hash = server._db(lambda db: db.execute(
+            "SELECT token_hash FROM mobile_devices WHERE device_id = ?", (device["deviceId"],)).fetchone()[0])
+        self.assertEqual(stored_hash, server._token_hash(device["token"]))
+        self.assertNotEqual(stored_hash, device["token"])
+        devices = c.json("GET", "/api/mobile/devices")[1]["devices"]
+        self.assertEqual([(item["deviceId"], item["name"]) for item in devices],
+                         [(device["deviceId"], "Test Android")])
+        self.assertEqual(c.json("DELETE", "/api/mobile/devices/" + device["deviceId"])[0], 200)
+        self.assertEqual(self.c.json("POST", "/api/mobile/transactions", {"transactions": []},
+                                     headers={"Authorization": "Bearer " + device["token"]})[0], 401)
+
+    def test_mobile_transactions_are_validated_deduplicated_and_user_scoped(self):
+        c = self.signed_in()
+        _, pairing = c.json("POST", "/api/mobile/pairing", {"notificationsAcknowledged": True})
+        _, device = self.c.json("POST", "/api/mobile/pair", {"code": pairing["code"]})
+        headers = {"Authorization": "Bearer " + device["token"]}
+        self.assertEqual(self.c.json("POST", "/api/mobile/transactions", {"transactions": []},
+                                     headers=headers)[0], 400)
+        self.assertEqual(self.c.json("POST", "/api/mobile/transactions", {
+            "transactions": [{"message": "Rs 25 debited"}],
+        }, headers=headers)[0], 400)
+        event = {
+            "eventId": "a" * 64,
+            "direction": "debit",
+            "amountMinor": 125050,
+            "currency": "INR",
+            "occurredAt": "2026-11-15T00:00:00+05:30",
+        }
+        code, imported = self.c.json("POST", "/api/mobile/transactions",
+                                     {"transactions": [event]}, headers=headers)
+        self.assertEqual((code, imported), (200, {"accepted": 1, "duplicates": 0}))
+        code, duplicate = self.c.json("POST", "/api/mobile/transactions",
+                                      {"transactions": [event]}, headers=headers)
+        self.assertEqual((code, duplicate), (200, {"accepted": 0, "duplicates": 1}))
+        listed = c.json("GET", "/api/mobile/transactions?after=0")[1]
+        self.assertEqual(len(listed["transactions"]), 1)
+        self.assertEqual(listed["transactions"][0]["description"], "BANK NOTIFICATION - DEBIT")
+        self.assertEqual(listed["transactions"][0]["amountMinor"], 125050)
+        self.assertEqual(listed["nextCursor"], listed["transactions"][0]["id"])
+        self.assertEqual(c.json("GET", "/api/mobile/transactions?after=nope")[0], 400)
+        self.assertEqual(self.c.json("GET", "/api/mobile/transactions")[0], 401)
+        server.add_user("other-user", "Other-pass-9")
+        other = self.signed_in("other-user", "Other-pass-9")
+        self.assertEqual(other.json("GET", "/api/mobile/transactions?after=0")[1]["transactions"], [])
+        self.assertEqual(other.json("GET", "/api/mobile/devices")[1]["devices"], [])
+
+    def test_clearing_account_data_revokes_mobile_devices_and_events(self):
+        c = self.signed_in()
+        _, pairing = c.json("POST", "/api/mobile/pairing", {"notificationsAcknowledged": True})
+        _, device = self.c.json("POST", "/api/mobile/pair", {"code": pairing["code"]})
+        headers = {"Authorization": "Bearer " + device["token"]}
+        event = {
+            "eventId": "b" * 64,
+            "direction": "credit",
+            "amountMinor": 50000,
+            "currency": "INR",
+            "occurredAt": "2026-11-14T19:00:00Z",
+        }
+        self.assertEqual(self.c.json("POST", "/api/mobile/transactions",
+                                     {"transactions": [event]}, headers=headers)[0], 200)
+        self.assertEqual(c.json("DELETE", "/api/state")[0], 200)
+        self.assertEqual(c.json("GET", "/api/mobile/devices")[1]["devices"], [])
+        self.assertEqual(c.json("GET", "/api/mobile/transactions?after=0")[1]["transactions"], [])
+        self.assertEqual(self.c.json("POST", "/api/mobile/transactions",
+                                     {"transactions": [event]}, headers=headers)[0], 401)
 
     def test_bank_routes_require_auth_csrf_and_valid_vua(self):
         self.assertEqual(self.c.json("GET", "/api/bank/status")[0], 401)

@@ -2,6 +2,7 @@
    Opened straight from disk (file://) it skips the backend and uses the browser's storage (no sign-in). */
 (function () {
   var KEYS = ['cp2', 'cpo', 'cpl', 'cph', 'cpm', 'cpf', 'cpn'];
+  var LOCAL_ONLY_KEYS = ['cp_mobile_cursor'];
   var online = /^https?:$/.test(location.protocol);
   var timers = {};
   var HDR = { 'Content-Type': 'application/json', 'X-Requested-With': 'cashpilot' };
@@ -15,7 +16,7 @@
 
   function toLogin() { location.replace('/login'); }
   function wipeLocal() {
-    KEYS.forEach(function (k) { try { window.localStorage.removeItem(k); } catch (e) {} });
+    KEYS.concat(LOCAL_ONLY_KEYS).forEach(function (k) { try { window.localStorage.removeItem(k); } catch (e) {} });
     try { window.localStorage.removeItem('cp_user'); } catch (e) {}
   }
 

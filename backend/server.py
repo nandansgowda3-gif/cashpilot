@@ -27,13 +27,14 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from backend.setu_aa import SetuAAClient, SetuError, extract_transactions
 
@@ -47,6 +48,9 @@ ALLOWED_KEYS = {"cp2", "cpo", "cpl", "cph", "cpm", "cpf", "cpn"}
 MAX_BODY = 5 * 1024 * 1024  # 5 MB for app data
 MAX_AUTH_BODY = 4 * 1024    # sign-in / sign-up bodies are tiny
 MAX_BANK_BODY = 4096
+MAX_MOBILE_BODY = 32 * 1024
+MOBILE_EVENT_LIMIT = 25
+MOBILE_PAIRING_TTL = 5 * 60
 
 COOKIE = "cp_session"
 CSRF_HEADER = "X-Requested-With"
@@ -59,6 +63,7 @@ SESSION_MAX = 7 * 86400       # and never later than 7 days after sign-in
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 VUA_RE = re.compile(r"^[0-9]{10}(?:@[A-Za-z0-9.-]{1,32})?$")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+MOBILE_SOURCE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MIN_PASSWORD, MAX_PASSWORD = 8, 128
 COMMON_PASSWORDS = {
     "password", "password1", "password123", "12345678", "123456789", "1234567890",
@@ -168,6 +173,33 @@ def _connect():
                 " session_id TEXT, session_status TEXT,"
                 " updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mobile_pairings ("
+                " code_hash TEXT PRIMARY KEY,"
+                " user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                " expires DOUBLE PRECISION NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mobile_devices ("
+                " device_id TEXT PRIMARY KEY,"
+                " token_hash TEXT NOT NULL UNIQUE,"
+                " user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                " name TEXT NOT NULL,"
+                " created DOUBLE PRECISION NOT NULL,"
+                " last_seen DOUBLE PRECISION NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mobile_transactions ("
+                " id BIGSERIAL PRIMARY KEY,"
+                " user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                " source_id TEXT NOT NULL,"
+                " direction TEXT NOT NULL,"
+                " amount_minor BIGINT NOT NULL,"
+                " occurred_at TEXT NOT NULL,"
+                " description TEXT NOT NULL,"
+                " created DOUBLE PRECISION NOT NULL,"
+                " UNIQUE(user_id, source_id))"
+            )
             conn.commit()
             _postgres_schema_ready = True
         return PostgresConnection(conn)
@@ -197,6 +229,27 @@ def _connect():
         " consent_status TEXT NOT NULL, range_from TEXT NOT NULL, range_to TEXT NOT NULL,"
         " session_id TEXT, session_status TEXT,"
         " updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+        "CREATE TABLE IF NOT EXISTS mobile_pairings ("
+        " code_hash TEXT PRIMARY KEY,"
+        " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        " expires REAL NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS mobile_devices ("
+        " device_id TEXT PRIMARY KEY,"
+        " token_hash TEXT NOT NULL UNIQUE,"
+        " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        " name TEXT NOT NULL,"
+        " created REAL NOT NULL,"
+        " last_seen REAL NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS mobile_transactions ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        " source_id TEXT NOT NULL,"
+        " direction TEXT NOT NULL,"
+        " amount_minor INTEGER NOT NULL,"
+        " occurred_at TEXT NOT NULL,"
+        " description TEXT NOT NULL,"
+        " created REAL NOT NULL,"
+        " UNIQUE(user_id, source_id));"
     )
     if fresh:
         try:
@@ -360,7 +413,12 @@ def put_key(uid, key, value):
 
 
 def clear_all(uid):
-    _db(lambda c: c.execute("DELETE FROM user_state WHERE user_id = ?", (uid,)))
+    _db(lambda c: (
+        c.execute("DELETE FROM user_state WHERE user_id = ?", (uid,)),
+        c.execute("DELETE FROM mobile_pairings WHERE user_id = ?", (uid,)),
+        c.execute("DELETE FROM mobile_devices WHERE user_id = ?", (uid,)),
+        c.execute("DELETE FROM mobile_transactions WHERE user_id = ?", (uid,)),
+    ))
 
 
 def get_bank_connection(uid):
@@ -396,6 +454,104 @@ def save_bank_connection(uid, connection):
 
 def delete_bank_connection(uid):
     _db(lambda c: c.execute("DELETE FROM bank_connections WHERE user_id = ?", (uid,)))
+
+
+def create_mobile_pairing(uid):
+    code = base64.b32encode(secrets.token_bytes(10)).decode("ascii").rstrip("=")
+    now = time.time()
+    _db(lambda c: (
+        c.execute("DELETE FROM mobile_pairings WHERE expires <= ?", (now,)),
+        c.execute("DELETE FROM mobile_pairings WHERE user_id = ?", (uid,)),
+        c.execute("INSERT INTO mobile_pairings (code_hash, user_id, expires) VALUES (?, ?, ?)",
+                  (_token_hash(code), uid, now + MOBILE_PAIRING_TTL)),
+    ))
+    return code
+
+
+def exchange_mobile_pairing(code, name):
+    now = time.time()
+    code_hash = _token_hash(code)
+    token = secrets.token_urlsafe(32)
+    device_id = str(uuid.uuid4())
+
+    def f(c):
+        query = "SELECT user_id, expires FROM mobile_pairings WHERE code_hash = ?"
+        if isinstance(c, PostgresConnection):
+            query += " FOR UPDATE"
+        row = c.execute(query, (code_hash,)).fetchone()
+        if not row or row[1] <= now:
+            c.execute("DELETE FROM mobile_pairings WHERE code_hash = ?", (code_hash,))
+            return None
+        uid = row[0]
+        c.execute("DELETE FROM mobile_pairings WHERE code_hash = ?", (code_hash,))
+        c.execute(
+            "INSERT INTO mobile_devices "
+            "(device_id, token_hash, user_id, name, created, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+            (device_id, _token_hash(token), uid, name, now, now))
+        return {"deviceId": device_id, "token": token}
+    return _db(f)
+
+
+def mobile_device_for_token(token):
+    if not token or len(token) > 100:
+        return None
+    th, now = _token_hash(token), time.time()
+
+    def f(c):
+        row = c.execute(
+            "SELECT device_id, user_id FROM mobile_devices WHERE token_hash = ?", (th,)).fetchone()
+        if not row:
+            return None
+        c.execute("UPDATE mobile_devices SET last_seen = ? WHERE device_id = ?", (now, row[0]))
+        return row[0], row[1]
+    return _db(f)
+
+
+def get_mobile_devices(uid):
+    return _db(lambda c: [{
+        "deviceId": row[0],
+        "name": row[1],
+        "created": row[2],
+        "lastSeen": row[3],
+    } for row in c.execute(
+        "SELECT device_id, name, created, last_seen FROM mobile_devices "
+        "WHERE user_id = ? ORDER BY created DESC", (uid,))])
+
+
+def delete_mobile_device(uid, device_id):
+    return _db(lambda c: c.execute(
+        "DELETE FROM mobile_devices WHERE user_id = ? AND device_id = ?", (uid, device_id)).rowcount > 0)
+
+
+def store_mobile_transactions(uid, events):
+    now = time.time()
+
+    def f(c):
+        added = 0
+        for event in events:
+            result = c.execute(
+                "INSERT INTO mobile_transactions "
+                "(user_id, source_id, direction, amount_minor, occurred_at, description, created) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, source_id) DO NOTHING",
+                (uid, event["eventId"], event["direction"], event["amountMinor"],
+                 event["occurredAt"], event["description"], now))
+            added += max(0, result.rowcount)
+        return added
+    return _db(f)
+
+
+def get_mobile_transactions(uid, after=0, limit=200):
+    return _db(lambda c: [{
+        "id": row[0],
+        "eventId": row[1],
+        "direction": row[2],
+        "amountMinor": row[3],
+        "occurredAt": row[4],
+        "description": row[5],
+    } for row in c.execute(
+        "SELECT id, source_id, direction, amount_minor, occurred_at, description "
+        "FROM mobile_transactions WHERE user_id = ? AND id > ? ORDER BY id LIMIT ?",
+        (uid, after, limit))])
 
 
 # ---- rate limiting ----------------------------------------------------------
@@ -657,6 +813,101 @@ class Handler(BaseHTTPRequestHandler):
         delete_bank_connection(uid)
         return self._send(200, {"ok": True})
 
+    def _mobile_create_pairing(self, uid):
+        wait = LIMITER.retry_after([("mobile-pair-issue:%s" % uid, 5, 3600)])
+        if wait:
+            return self._error(429, "Too many pairing codes requested. Try again later.",
+                               headers=[("Retry-After", str(wait))])
+        code = create_mobile_pairing(uid)
+        LIMITER.add("mobile-pair-issue:%s" % uid)
+        return self._send(201, {"code": code, "expiresIn": MOBILE_PAIRING_TTL})
+
+    def _mobile_exchange_pairing(self, payload):
+        code = payload.get("code")
+        name = payload.get("deviceName", "Android phone")
+        if (set(payload) - {"code", "deviceName"} or not isinstance(code, str)
+                or not re.fullmatch(r"[A-Z2-7]{16}", code.strip().upper())
+                or not isinstance(name, str) or not name.strip() or len(name.strip()) > 40
+                or any(ord(char) < 32 for char in name)):
+            return self._error(400, "Enter a valid pairing code and device name.")
+        ipkey = "mobile-pair-ip:" + self._ip()
+        wait = LIMITER.retry_after([(ipkey, 10, 15 * 60)])
+        if wait:
+            return self._error(429, "Too many pairing attempts. Try again later.",
+                               headers=[("Retry-After", str(wait))])
+        result = exchange_mobile_pairing(code.strip().upper(), name.strip())
+        LIMITER.add(ipkey)
+        if not result:
+            return self._error(401, "Pairing code is invalid or expired.")
+        return self._send(201, result)
+
+    def _mobile_ingest(self):
+        device = self._mobile_auth()
+        if not device:
+            return self._error(401, "Device is not paired.")
+        rate_key = "mobile-ingest:%s" % device[0]
+        wait = LIMITER.retry_after([(rate_key, 120, 60)])
+        if wait:
+            return self._error(429, "Too many transaction sync requests. Try again shortly.",
+                               headers=[("Retry-After", str(wait))])
+        LIMITER.add(rate_key)
+        payload = self._json_body(MAX_MOBILE_BODY)
+        if payload is None:
+            return
+        transactions = payload.get("transactions")
+        if (set(payload) != {"transactions"} or not isinstance(transactions, list)
+                or not transactions or len(transactions) > MOBILE_EVENT_LIMIT):
+            return self._error(400, "Send between 1 and %d transactions." % MOBILE_EVENT_LIMIT)
+        events = []
+        now = datetime.now(timezone.utc)
+        for item in transactions:
+            if not isinstance(item, dict) or set(item) != {
+                    "eventId", "direction", "amountMinor", "currency", "occurredAt"}:
+                return self._error(400, "A transaction has an invalid shape.")
+            event_id = item["eventId"]
+            direction = item["direction"]
+            amount_minor = item["amountMinor"]
+            currency = item["currency"]
+            occurred_at = item["occurredAt"]
+            if (not isinstance(event_id, str) or not MOBILE_SOURCE_ID_RE.fullmatch(event_id)
+                    or direction not in ("debit", "credit")
+                    or not isinstance(amount_minor, int) or isinstance(amount_minor, bool)
+                    or amount_minor < 1 or amount_minor > 1000000000000
+                    or currency != "INR" or not isinstance(occurred_at, str)):
+                return self._error(400, "A transaction contains invalid values.")
+            try:
+                timestamp = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+                if timestamp.tzinfo is None:
+                    raise ValueError()
+                timestamp = timestamp.astimezone(timezone.utc)
+            except ValueError:
+                return self._error(400, "Transaction timestamps must include a timezone.")
+            if timestamp > now + timedelta(minutes=5) or timestamp < datetime(2010, 1, 1, tzinfo=timezone.utc):
+                return self._error(400, "A transaction timestamp is outside the supported range.")
+            events.append({
+                "eventId": event_id,
+                "direction": direction,
+                "amountMinor": amount_minor,
+                "occurredAt": _utc_iso(timestamp),
+                "description": "BANK NOTIFICATION - " + direction.upper(),
+            })
+        added = store_mobile_transactions(device[1], events)
+        return self._send(200, {"accepted": added, "duplicates": len(events) - added})
+
+    def _mobile_list_transactions(self, uid):
+        query = parse_qs(urlparse(self.path).query)
+        raw_after = query.get("after", ["0"])[0]
+        if not raw_after.isdigit() or len(raw_after) > 18:
+            return self._error(400, "Invalid transaction cursor.")
+        after = int(raw_after)
+        transactions = get_mobile_transactions(uid, after, 200)
+        next_cursor = transactions[-1]["id"] if transactions else after
+        return self._send(200, {
+            "transactions": transactions,
+            "nextCursor": next_cursor,
+            "hasMore": len(transactions) == 200,
+        })
+
     def _redirect(self, location):
         self._send(302, b"", "text/plain", headers=[("Location", location)])
 
@@ -683,6 +934,13 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self):
         res = session_user(self._token())
         return res  # (user_id, username) or None
+
+    def _mobile_auth(self):
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer "):
+            return None
+        token = authorization[7:].strip()
+        return mobile_device_for_token(token)
 
     def _csrf_ok(self):
         if self.headers.get(CSRF_HEADER) != CSRF_VALUE:
@@ -738,6 +996,13 @@ class Handler(BaseHTTPRequestHandler):
             if not who:
                 return self._error(401, "Not signed in")
             return self._send(200, {"username": who[1]})
+        if path in ("/api/mobile/transactions", "/api/mobile/devices"):
+            who = self._auth()
+            if not who:
+                return self._error(401, "Not signed in")
+            if path == "/api/mobile/transactions":
+                return self._mobile_list_transactions(who[0])
+            return self._send(200, {"devices": get_mobile_devices(who[0])})
         if path in ("/api/bank/status", "/api/bank/transactions"):
             who = self._auth()
             if not who:
@@ -759,6 +1024,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/mobile/pair":
+            payload = self._json_body(MAX_MOBILE_BODY)
+            if payload is None:
+                return
+            return self._mobile_exchange_pairing(payload)
+        if path == "/api/mobile/transactions":
+            return self._mobile_ingest()
+        if path == "/api/mobile/pairing":
+            if not self._csrf_ok():
+                return self._error(403, "Request blocked")
+            who = self._auth()
+            if not who:
+                return self._error(401, "Not signed in")
+            payload = self._json_body(MAX_BANK_BODY)
+            if payload is None:
+                return
+            if payload != {"notificationsAcknowledged": True}:
+                return self._error(400, "Confirm that you want to pair an Android device for transaction notifications.")
+            return self._mobile_create_pairing(who[0])
         if path in ("/api/bank/consent", "/api/bank/sync"):
             if not self._csrf_ok():
                 return self._error(403, "Request blocked")
@@ -851,6 +1135,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
+        if path == "/api/mobile/device":
+            device = self._mobile_auth()
+            if not device:
+                return self._error(401, "Device is not paired.")
+            delete_mobile_device(device[1], device[0])
+            return self._send(200, {"ok": True})
+        if path.startswith("/api/mobile/devices/"):
+            who = self._auth()
+            if not who:
+                return self._error(401, "Not signed in")
+            if not self._csrf_ok():
+                return self._error(403, "Request blocked")
+            device_id = path.rsplit("/", 1)[-1]
+            if not UUID_RE.fullmatch(device_id):
+                return self._error(400, "Invalid device ID.")
+            if not delete_mobile_device(who[0], device_id):
+                return self._error(404, "Device not found.")
+            return self._send(200, {"ok": True})
         if path not in ("/api/state", "/api/bank/connection"):
             return self._error(404, "Unknown API route")
         who = self._auth()

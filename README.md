@@ -82,14 +82,28 @@ CashPilot does not generate Setu API keys; obtain sandbox credentials directly f
 
 The sandbox routes are authenticated and state-changing routes require the app's CSRF header: `GET /api/bank/status`, `POST /api/bank/consent`, `POST /api/bank/sync`, `GET /api/bank/transactions`, and `DELETE /api/bank/connection`. Keep all three Setu variables in the hosting provider's secret/environment settings, never in frontend code or a committed `.env` file.
 
+## Android notification companion
+
+The optional Android companion in `android/companion/` can import clearly recognized debit/credit alerts from notification sources that the user explicitly selects. It uses Android notification access; it does not request SMS permissions or access a bank account. Notification parsing happens on the phone, and the companion sends only direction, amount in paise, timestamp, INR currency, and a SHA-256 event ID. Raw message text, OTPs, balances, account numbers, and bank credentials are not uploaded. The Android app keeps only normalized transaction data in a Keystore-encrypted local retry queue when the network is unavailable.
+
+To try it:
+
+1. Import a real CSV statement for one account in CashPilot's **Data** tab and enter its statement closing balance. Sample data cannot be combined with notification imports.
+2. Open `android/companion/` in Android Studio and run the companion on your Android phone. iOS does not support reading arbitrary SMS or other apps' notifications.
+3. In CashPilot's **Data** tab, acknowledge the notification pairing and create a one-time code. Enter it in the companion within five minutes.
+4. In Android Settings, explicitly enable CashPilot's notification access. In the companion, choose only the apps that carry bank transaction alerts, then enable auto-import. Auto-import starts off.
+5. CashPilot merges new events into the forecast while the dashboard is open; events received while it is closed appear next time you open it. Revoke a paired device from the **Data** tab; clearing CashPilot account data also revokes devices and removes imported events.
+
+The mobile API accepts only validated INR transaction fields. Pairing codes are single-use and expire after five minutes; device tokens are hashed in CashPilot and can be revoked. The reader intentionally skips unknown or ambiguous message formats instead of guessing, so it cannot guarantee 100% coverage across all banks or Android devices. Imported alerts are informational, not an authoritative bank ledger: messages can be delayed, omitted, duplicated, or later reversed. Verify them against your bank statement. The Android project requires Android Studio/SDK to build; the repository currently does not include a built APK.
+
 ## How it fits together
 
 - `frontend/login.html` (+ `login.js`, `login.css`) is the sign-in page. `index.html` is the app (plain HTML and JavaScript). `boot.js` checks you are signed in, loads your saved data from the backend, then starts `app.js`.
-- `backend/server.py` serves the frontend and stores users, sessions, app data, and minimal Setu sandbox consent state in `data/cashpilot.db` (SQLite). API: `POST /api/login`, `/api/register`, `/api/logout`; `GET /api/me`, `/api/config`, `/api/health`, `/api/state`, `/api/export`; `PUT /api/state/<key>`; `DELETE /api/state`; plus the sandbox endpoints above.
+- `backend/server.py` serves the frontend and stores users, sessions, app data, mobile device tokens/events, and minimal Setu sandbox consent state in `data/cashpilot.db` (SQLite). API: `POST /api/login`, `/api/register`, `/api/logout`; `GET /api/me`, `/api/config`, `/api/health`, `/api/state`, `/api/export`, `/api/mobile/devices`, `/api/mobile/transactions`; `PUT /api/state/<key>`; `DELETE /api/state`; plus the sandbox and mobile pairing endpoints above.
 - Opening `frontend/index.html` directly from disk still works for a quick look, with no sign-in: it uses the browser's own storage instead of the backend.
 
 ## Notes
 
 - Money tab: tap a spending category (or "Edit received money") to change totals, amounts, descriptions and categories, or delete items.
-- CSV import is currently the only way to bring in transactions from a bank statement; live bank sync is not enabled.
+- CSV import initializes real transaction history and its statement closing balance. Android notification import can append recognized future alerts; direct live bank sync is not enabled.
 - The assistant (robot button) understands a fixed set of phrases; type `help` to see them.
